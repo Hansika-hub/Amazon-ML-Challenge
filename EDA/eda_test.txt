@@ -1,0 +1,95 @@
+loading source1: /content/drive/MyDrive/Amazon_Ml/6ab10eb3b23ba_student_resource/student_resource/dataset/test/test_source1.tsv
+
+============================================================================
+SOURCE 1  —  1,732,544 records
+============================================================================
+
+[country]
+  India               809,986  (46.75%)
+  US                  663,106  (38.27%)
+  France              259,452  (14.98%)
+
+[missing / blank]
+  business_name      blank:            0 (0.00%)
+  business_address   blank:            0 (0.00%)
+  country            blank:            0 (0.00%)
+  name AND address blank: 0   |   name<=2 chars: 0
+
+[duplicates]
+  duplicate entity_id: 0  (should be 0)
+  duplicate name+address: 0 (0.00%)   <- S1 is meant to be deduplicated
+  repeated business_name: 494,300 (28.53%)   -> name-only blocking collides this many
+
+[field length — tokens]
+  business_name      p50=4 p90=5 p99=6 max=13
+  business_address   p50=8 p90=14 p99=19 max=43
+
+[charset — where non-Latin script lives]
+  business_name: non_ascii=40,789, accents=40,788
+    non-ascii by country: France=40,789
+  business_address: non_ascii=73,800, accents=72,704
+    non-ascii by country: France=73,335, India=465
+loading source2: /content/drive/MyDrive/Amazon_Ml/6ab10eb3b23ba_student_resource/student_resource/dataset/test/test_source2.tsv
+
+============================================================================
+SOURCE 2  —  4,887,273 records
+============================================================================
+
+[country]
+  India             2,312,565  (47.32%)
+  US                1,871,330  (38.29%)
+  France              703,378  (14.39%)
+
+[missing / blank]
+  business_name      blank:            0 (0.00%)
+  business_address   blank:      129,408 (2.65%)
+  country            blank:            0 (0.00%)
+  name AND address blank: 0   |   name<=2 chars: 10,166
+
+[duplicates]
+  duplicate entity_id: 0  (should be 0)
+  duplicate name+address: 32,012 (0.66%)
+  repeated business_name: 680,196 (13.92%)   -> name-only blocking collides this many
+
+[field length — tokens]
+  business_name      p50=4 p90=5 p99=6 max=14
+  business_address   p50=7 p90=13 p99=19 max=43
+
+[charset — where non-Latin script lives]
+  business_name: non_ascii=928,158, accents=381,551, devanagari=309,103
+    non-ascii by country: India=638,614, France=172,617, US=116,927
+  business_address: non_ascii=720,665, accents=128,907, devanagari=318,369
+    non-ascii by country: India=551,461, France=169,163, US=41
+loading source3: /content/drive/MyDrive/Amazon_Ml/6ab10eb3b23ba_student_resource/student_resource/dataset/test/test_source3.tsv
+
+============================================================================
+SOURCE 3  —  5,082,316 records
+============================================================================
+
+[country]
+  India             2,405,000  (47.32%)
+  US                1,945,701  (38.28%)
+  France              731,615  (14.40%)
+
+[missing / blank]
+  business_name      blank:            0 (0.00%)
+  business_address   blank:      136,098 (2.68%)
+  country            blank:            0 (0.00%)
+  name AND address blank: 0   |   name<=2 chars: 19,910
+
+[duplicates]
+  duplicate entity_id: 0  (should be 0)
+  duplicate name+address: 21,856 (0.43%)
+  repeated business_name: 636,225 (12.52%)   -> name-only blocking collides this many
+
+[field length — tokens]
+  business_name      p50=4 p90=5 p99=7 max=14
+  business_address   p50=7 p90=12 p99=19 max=43
+
+[charset — where non-Latin script lives]
+  business_name: non_ascii=737,515, accents=416,873, devanagari=181,068
+    non-ascii by country: India=437,903, France=175,185, US=124,427
+  business_address: non_ascii=729,222, accents=137,179, devanagari=319,073
+    non-ascii by country: India=551,274, France=177,914, US=34
+
+(no ground_truth -> test data; source profiling only)

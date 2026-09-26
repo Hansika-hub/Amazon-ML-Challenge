@@ -1,0 +1,123 @@
+loading source1: /content/drive/MyDrive/Amazon_Ml/6ab10eb3b23ba_student_resource/student_resource/dataset/train/train_source1.tsv
+
+============================================================================
+SOURCE 1  —  2,206,821 records
+============================================================================
+
+[country]
+  US                1,323,633  (59.98%)
+  India               883,188  (40.02%)
+
+[missing / blank]
+  business_name      blank:            0 (0.00%)
+  business_address   blank:            0 (0.00%)
+  country            blank:            0 (0.00%)
+  name AND address blank: 0   |   name<=2 chars: 0
+
+[duplicates]
+  duplicate entity_id: 0  (should be 0)
+  duplicate name+address: 0 (0.00%)   <- S1 is meant to be deduplicated
+  repeated business_name: 668,017 (30.27%)   -> name-only blocking collides this many
+
+[field length — tokens]
+  business_name      p50=4 p90=5 p99=6 max=13
+  business_address   p50=7 p90=13 p99=19 max=43
+
+[charset — where non-Latin script lives]
+  business_name: (all ASCII)
+  business_address: non_ascii=554, accents=554
+    non-ascii by country: India=554
+loading source2: /content/drive/MyDrive/Amazon_Ml/6ab10eb3b23ba_student_resource/student_resource/dataset/train/train_source2.tsv
+
+============================================================================
+SOURCE 2  —  5,034,616 records
+============================================================================
+
+[country]
+  US                3,016,817  (59.92%)
+  India             2,017,799  (40.08%)
+
+[missing / blank]
+  business_name      blank:            0 (0.00%)
+  business_address   blank:      168,967 (3.36%)
+  country            blank:            0 (0.00%)
+  name AND address blank: 0   |   name<=2 chars: 704
+
+[duplicates]
+  duplicate entity_id: 0  (should be 0)
+  duplicate name+address: 36,650 (0.73%)
+  repeated business_name: 747,146 (14.84%)   -> name-only blocking collides this many
+
+[field length — tokens]
+  business_name      p50=4 p90=5 p99=6 max=15
+  business_address   p50=6 p90=13 p99=18 max=45
+
+[charset — where non-Latin script lives]
+  business_name: non_ascii=764,608, accents=290,263, devanagari=269,424
+    non-ascii by country: India=562,437, US=202,171
+  business_address: non_ascii=478,453, accents=1,202, devanagari=277,523
+    non-ascii by country: India=478,396, US=57
+loading source3: /content/drive/MyDrive/Amazon_Ml/6ab10eb3b23ba_student_resource/student_resource/dataset/train/train_source3.tsv
+
+============================================================================
+SOURCE 3  —  5,285,603 records
+============================================================================
+
+[country]
+  US                3,170,056  (59.98%)
+  India             2,115,547  (40.02%)
+
+[missing / blank]
+  business_name      blank:            0 (0.00%)
+  business_address   blank:      175,916 (3.33%)
+  country            blank:            0 (0.00%)
+  name AND address blank: 0   |   name<=2 chars: 9,275
+
+[duplicates]
+  duplicate entity_id: 0  (should be 0)
+  duplicate name+address: 24,031 (0.45%)
+  repeated business_name: 706,520 (13.37%)   -> name-only blocking collides this many
+
+[field length — tokens]
+  business_name      p50=4 p90=5 p99=7 max=14
+  business_address   p50=6 p90=12 p99=18 max=36
+
+[charset — where non-Latin script lives]
+  business_name: non_ascii=606,737, accents=328,213, devanagari=158,003
+    non-ascii by country: India=391,172, US=215,565
+  business_address: non_ascii=476,588, accents=1,021, devanagari=275,861
+    non-ascii by country: India=476,536, US=52
+
+============================================================================
+GROUND TRUTH
+============================================================================
+
+rows (S1 entities): 2,206,821
+  singletons (0 matches): 123,247 (5.58%)   <- correct empty = full 1.0 on F0.5
+  matched (>=1):          2,083,574 (94.42%)
+     0 match(es):      123,247 (5.58%)
+     1 match(es):      119,157 (5.40%)
+     2 match(es):      375,212 (17.00%)
+     3 match(es):      530,841 (24.05%)
+     4 match(es):      484,115 (21.94%)
+     5 match(es):      321,957 (14.59%)
+     6 match(es):      164,868 (7.47%)
+     7 match(es):       63,968 (2.90%)
+     8 match(es):       18,680 (0.85%)
+     9 match(es):        4,205 (0.19%)
+    10 match(es):          534 (0.02%)
+    11 match(es):           37 (0.00%)
+
+[matched-ID breakdown] total matched pairs: 7,638,365
+  -> S2: 3,693,619
+  -> S3: 3,944,746
+
+[country-safe blocking check]  (on sampled true pairs)
+  same-country: 50,000 (100.00%)   cross-country: 0 (0.00%)
+  (cross ~0 -> partition by country for free; unresolved=0)
+
+[blocking-signal probe] sampled 50,000 true pairs
+  name token Jaccard: p10=0.00 p50=0.67 p90=1.00 mean=0.62
+  addr token Jaccard: p10=0.25 p50=0.62 p90=1.00 mean=0.60
+  share >=1 name token: 85.61%  <- recall ceiling, name blocking
+  share >=1 addr token: 95.62%  <- recall ceiling, addr blocking
