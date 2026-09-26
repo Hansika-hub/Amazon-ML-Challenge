@@ -90,25 +90,49 @@ try:
 except ImportError:
     HAVE_INDIC = False
 
+import re
+import time
+import unicodedata
+from collections import Counter
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+
 try:
-    from aksharamukha import transliterate as aksharamukha_translit
-    HAVE_AKSHARAMUKHA = True
+    import jellyfish
+    HAVE_JELLYFISH = True
 except ImportError:
-    HAVE_AKSHARAMUKHA = False
+    HAVE_JELLYFISH = False
+
+try:
+    from indic_transliteration import sanscript
+    HAVE_INDIC = True
+except ImportError:
+    HAVE_INDIC = False
 
 
-# ------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 
-ENABLE_TRANSLITERATION = True
-ENABLE_SORTED_TOKENS = True
-ENABLE_PHONETIC = True
+PROFILE = True
+
+# Your EDA shows virtually all non-Latin data is from India.
+# Keep this True for the fastest production path.
+INDIA_ONLY_TRANSLITERATION = True
+
+# Your EDA found a few US exceptions.
+# Set this to True if you want those rare rows checked too.
+CHECK_NON_INDIA_FOR_INDIC = False
+
+# Cache size. Increase if RAM allows.
+CACHE_SIZE = 300_000
 
 
-# ------------------------------------------------------------
-# CONSTANTS / DICTIONARIES
-# ------------------------------------------------------------
+# ============================================================
+# CONSTANTS
+# ============================================================
 
 SUFFIX_MAP = {
     r"\bpvt\.?\s+ltd\.?\b": "private limited",
@@ -118,6 +142,7 @@ SUFFIX_MAP = {
     r"\bs\s+a\s+s\b": "sas",
     r"\ba\s+s\b": "sas",
     r"\br\s+l\b": "sarl",
+
     r"प्राइवेट\s+लिमिटेड": "private limited",
     r"प्रा\s*लि": "private limited",
 
@@ -137,13 +162,11 @@ SUFFIX_MAP = {
     r"\beurl\b": "eurl",
     r"\bsci\b": "sci",
     r"\bsa\b": "sa",
+
     r"लिमिटेड": "limited",
     r"\bलि\b": "limited",
 }
-SUFFIX_TOKENS = set(SUFFIX_MAP.values())
-_SUFFIX_STRIP_PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(t) for t in SUFFIX_TOKENS) + r")\b"
-)
+
 
 STREET_MAP = {
     r"\brd\.?\b": "road",
@@ -161,42 +184,105 @@ STREET_MAP = {
     r"\bav\.?\b": "avenue",
     r"\bbd\.?\b": "boulevard",
     r"\ballée\b": "allee",
-    r"\ballee\b": "allee",
+    r"\bal lee\b": "allee",
     r"\ball\.?\b": "allee",
     r"\bimpasse\b": "impasse",
     r"\broute\b": "route",
 }
 
+
+SUFFIX_TOKENS = set(SUFFIX_MAP.values())
+
+
+# ============================================================
+# REGEXES
+# ============================================================
+
 UNIT_PATTERN = re.compile(
     r"\b(?:(?:unit|apt|apartment|suite|ste|#)\s*[:\-]?\s*)+([a-z0-9\-]+)",
-    flags=re.IGNORECASE,
-)
-
-LEADING_JUNK_PATTERN = re.compile(r"^[^a-zA-Z0-9\u0900-\u097F\u0B80-\u0BFF\u0C80-\u0CFF]+")
-PUNCT_PATTERN = re.compile(r"[.,;:()\[\]{}\"'`|]")
-AMP_PATTERN = re.compile(r"&")
-WHITESPACE_PATTERN = re.compile(r"\s+")
-
-_URL_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?([a-z0-9][a-z0-9\-]*\.[a-z]{2,}(?:\.[a-z]{2,})?)",
     re.IGNORECASE,
 )
-_EMAIL_RE = re.compile(r"[\w.+-]+@([\w-]+\.[\w.-]+)")
 
-_NUMERIC_TOKEN_RE = re.compile(r"\b\d[\d/\-]*\b")
+LEADING_JUNK_PATTERN = re.compile(
+    r"^[^a-zA-Z0-9\u0900-\u0DFF]+"
+)
 
-_SCRIPT_RANGES = {
+PUNCT_PATTERN = re.compile(
+    r"[.,;:()[\]{}\"\'\`|]"
+)
+
+AMP_PATTERN = re.compile(r"&")
+
+WHITESPACE_PATTERN = re.compile(r"\s+")
+
+URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?"
+    r"([a-z0-9][a-z0-9\-]*\.[a-z]{2,}(?:\.[a-z]{2,})?)",
+    re.IGNORECASE,
+)
+
+EMAIL_RE = re.compile(
+    r"[\w.+-]+@([\w-]+\.[\w.-]+)"
+)
+
+NUMERIC_TOKEN_RE = re.compile(
+    r"\b\d[\d/\-]*\b"
+)
+
+
+# ============================================================
+# SCRIPT RANGES
+# ============================================================
+
+SCRIPT_RANGES = {
     "devanagari": (0x0900, 0x097F),
-    "tamil": (0x0B80, 0x0BFF),
     "bengali": (0x0980, 0x09FF),
+    "gurmukhi": (0x0A00, 0x0A7F),
+    "gujarati": (0x0A80, 0x0AFF),
+    "tamil": (0x0B80, 0x0BFF),
     "telugu": (0x0C00, 0x0C7F),
     "kannada": (0x0C80, 0x0CFF),
     "malayalam": (0x0D00, 0x0D7F),
-    "gujarati": (0x0A80, 0x0AFF),
-    "gurmukhi": (0x0A00, 0x0A7F),
 }
 
-_SANSCRIPT_SCHEME = {
+
+# One regex for "does this contain any Indic character?"
+INDIC_ANY_RE = re.compile(
+    r"[\u0900-\u0DFF]"
+)
+
+
+# Individual script regexes.
+SCRIPT_REGEXES = {
+    name: re.compile(
+        f"[\\u{lo:04X}-\\u{hi:04X}]"
+    )
+    for name, (lo, hi) in SCRIPT_RANGES.items()
+}
+
+
+# Character → script lookup.
+#
+# This is the fast path.
+#
+# Example:
+#   र -> devanagari
+#   त -> tamil
+#   क -> telugu
+#   क -> kannada
+#
+SCRIPT_BY_CHAR = {}
+
+for script, (lo, hi) in SCRIPT_RANGES.items():
+    for codepoint in range(lo, hi + 1):
+        SCRIPT_BY_CHAR[chr(codepoint)] = script
+
+
+# ============================================================
+# TRANSLITERATION SCHEMES
+# ============================================================
+
+SANSCRIPT_SCHEME = {
     "devanagari": "DEVANAGARI",
     "gujarati": "GUJARATI",
     "gurmukhi": "GURMUKHI",
@@ -204,405 +290,1231 @@ _SANSCRIPT_SCHEME = {
     "kannada": "KANNADA",
     "malayalam": "MALAYALAM",
     "telugu": "TELUGU",
+    "tamil":"TAMIL"
 }
 
-# Trailing schwa-artifact cleanup after ITRANS transliteration.
-# Targeted: only strips a bare trailing "a" that follows a consonant
-# letter, and only when doing so still leaves a real word behind.
-_SCHWA_STRIP_RE = re.compile(r"(?<=[bcdfghjklmnpqrstvwxyz])a\b")
 
-# Common short/legit English words ending in "a" that must be
-# protected from schwa-stripping (e.g. "india" must not -> "ind").
-_SCHWA_PROTECT = {
-    "a", "sea", "tea", "yoga", "pizza", "plaza", "india", "asia",
-    "africa", "america", "data", "media", "extra", "camera", "opera",
-    "banana", "pasta", "visa", "gala", "vega", "nova", "delta",
-    "omega", "sigma", "alpha", "beta", "theta",
+# ============================================================
+# SCHWA CLEANING
+# ============================================================
+
+SCHWA_STRIP_RE = re.compile(
+    r"(?<=[bcdfghjklmnpqrstvwxyz])a\b"
+)
+
+SCHWA_PROTECT = {
+    "a",
+    "sea",
+    "tea",
+    "yoga",
+    "pizza",
+    "plaza",
+    "india",
+    "asia",
+    "africa",
+    "america",
+    "data",
+    "media",
+    "extra",
+    "camera",
+    "opera",
+    "banana",
+    "pasta",
+    "visa",
+    "gala",
+    "vega",
+    "nova",
+    "delta",
+    "omega",
+    "sigma",
+    "alpha",
+    "beta",
+    "theta",
 }
 
-# Any Indic-script codepoint that survives transliteration (rare library
-# gaps, e.g. candra-O vowel signs) is a leftover, not intended output.
-_RESIDUAL_SCRIPT_RE = re.compile(
-    r"[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF"
-    r"\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F]"
+
+RESIDUAL_SCRIPT_RE = re.compile(
+    r"[\u0900-\u097F"
+    r"\u0980-\u09FF"
+    r"\u0A00-\u0A7F"
+    r"\u0A80-\u0AFF"
+    r"\u0B80-\u0BFF"
+    r"\u0C00-\u0C7F"
+    r"\u0C80-\u0CFF"
+    r"\u0D00-\u0D7F]"
 )
 
 
-def _strip_residual_script(text: str) -> str:
-    if not text:
-        return text
-    return WHITESPACE_PATTERN.sub(" ", _RESIDUAL_SCRIPT_RE.sub("", text)).strip()
+# ============================================================
+# COMBINED DICTIONARY REGEX
+# ============================================================
 
-
-def _strip_schwa(word: str) -> str:
-    if word in _SCHWA_PROTECT or len(word) <= 3:
-        return word
-    stripped = _SCHWA_STRIP_RE.sub("", word)
-    return stripped if stripped else word
-
-
-def clean_transliteration(text):
-    """Light, targeted schwa cleanup on ITRANS output. Never touches
-    already-Latin input (only called on transliterated strings)."""
-    if not text:
-        return text
-    words = text.split()
-    return " ".join(_strip_schwa(w) for w in words)
-
-
-# ------------------------------------------------------------
-# CORE TEXT CLEANUP
-# ------------------------------------------------------------
-
-def unicode_normalize(series: pd.Series) -> pd.Series:
-    return series.astype(str).map(
-        lambda x: unicodedata.normalize("NFKC", x) if pd.notna(x) else x
+def build_combined_regex(mapping):
+    return re.compile(
+        "(" +
+        "|".join(
+            f"({pattern})"
+            for pattern in mapping.keys()
+        ) +
+        ")"
     )
 
 
-def casefold_series(series: pd.Series) -> pd.Series:
-    return series.astype(str).map(lambda x: x.casefold() if pd.notna(x) else x)
+SUFFIX_COMBINED = build_combined_regex(SUFFIX_MAP)
+STREET_COMBINED = build_combined_regex(STREET_MAP)
+
+SUFFIX_REPLACEMENTS = list(SUFFIX_MAP.values())
+STREET_REPLACEMENTS = list(STREET_MAP.values())
 
 
-def strip_leading_junk(series: pd.Series) -> pd.Series:
-    return series.str.replace(LEADING_JUNK_PATTERN, "", regex=True)
+def make_combined_replacer(replacements):
+
+    def replacer(match):
+
+        groups = match.groups()
+
+        for i, value in enumerate(groups[1:]):
+
+            if value is not None:
+                return replacements[i]
+
+        return match.group(0)
+
+    return replacer
 
 
-def normalize_whitespace(series: pd.Series) -> pd.Series:
-    return series.str.replace(WHITESPACE_PATTERN, " ", regex=True).str.strip()
+SUFFIX_REPLACER = make_combined_replacer(
+    SUFFIX_REPLACEMENTS
+)
+
+STREET_REPLACER = make_combined_replacer(
+    STREET_REPLACEMENTS
+)
 
 
-def normalize_punctuation(series: pd.Series) -> pd.Series:
-    series = series.str.replace(AMP_PATTERN, " and ", regex=True)
-    series = series.str.replace(PUNCT_PATTERN, " ", regex=True)
-    return normalize_whitespace(series)
+# ============================================================
+# BASIC STRING HELPERS
+# ============================================================
+
+def normalize_whitespace_str(text):
+
+    return WHITESPACE_PATTERN.sub(
+        " ",
+        text
+    ).strip()
 
 
-def apply_dictionary(series: pd.Series, mapping: dict) -> pd.Series:
-    for pattern, replacement in mapping.items():
-        series = series.str.replace(pattern, replacement, regex=True)
-    return normalize_whitespace(series)
+def normalize_punctuation_str(text):
 
-
-def basic_clean(series: pd.Series) -> pd.Series:
-    s = unicode_normalize(series)
-    s = casefold_series(s)
-    s = strip_leading_junk(s)
-    s = normalize_whitespace(s)
-    s = normalize_punctuation(s)
-    return s
-
-
-# ------------------------------------------------------------
-# DOMAIN EXTRACTION (fixed: removed from name_normalized after extraction)
-# ------------------------------------------------------------
-
-def extract_domain(text):
-    if not text:
-        return None
-    m = _EMAIL_RE.search(text)
-    if m:
-        return m.group(1).lower().rstrip(".")
-    m = _URL_RE.search(text)
-    if m:
-        domain = m.group(1).lower().rstrip(".")
-        if "." in domain and not domain.replace(".", "").isdigit():
-            return domain
-    return None
-
-
-def extract_domain_series(series: pd.Series) -> pd.Series:
-    return series.map(extract_domain)
-
-
-def remove_domain_fragment(series: pd.Series) -> pd.Series:
-    """Strip an embedded URL/email domain fragment out of the raw text
-    BEFORE normalization, so the domain never survives inside
-    name_normalized. Runs on the raw (pre-clean) string since the URL
-    regex expects real punctuation (dots, @, /)."""
-    stripped = series.str.replace(_EMAIL_RE, " ", regex=True)
-    stripped = stripped.str.replace(_URL_RE, " ", regex=True)
-    return stripped
-
-
-# ------------------------------------------------------------
-# SCRIPT DETECTION
-# ------------------------------------------------------------
-
-def detect_script_one(text: str) -> str:
-    if not text or not text.strip():
-        return "unknown"
-    counts = Counter()
-    for ch in text:
-        cp = ord(ch)
-        if cp < 128:
-            if ch.isalpha():
-                counts["latin"] += 1
-            continue
-        for name, (lo, hi) in _SCRIPT_RANGES.items():
-            if lo <= cp <= hi:
-                counts[name] += 1
-                break
-    if not counts:
-        return "unknown"
-    dominant, dom_count = counts.most_common(1)[0]
-    total = sum(counts.values())
-    if dom_count / total < 0.6 and len(counts) > 1:
-        return "mixed"
-    return dominant
-
-
-def detect_script_series(series: pd.Series) -> pd.Series:
-    return series.map(lambda x: detect_script_one(x) if pd.notna(x) else "unknown")
-
-
-# ------------------------------------------------------------
-# TRANSLITERATION (ITRANS-based, per Section 2 of instructions)
-# ------------------------------------------------------------
-
-def _itrans_transliterate(text: str, script: str):
-    if not HAVE_INDIC or script not in _SANSCRIPT_SCHEME:
-        return None
-    try:
-        src_scheme = getattr(sanscript, _SANSCRIPT_SCHEME[script])
-        return sanscript.transliterate(text, src_scheme, sanscript.ITRANS).lower()
-    except Exception:
-        return None
-
-
-def _tamil_transliterate(text: str):
-    if not HAVE_AKSHARAMUKHA:
-        return None
-    try:
-        return aksharamukha_translit.process("Tamil", "ISO", text).lower()
-    except Exception:
-        return None
-
-
-def _translit_run(script: str, chunk: str):
-    if script == "tamil":
-        return _tamil_transliterate(chunk)
-    if script in _SANSCRIPT_SCHEME:
-        return _itrans_transliterate(chunk, script)
-    return None
-
-
-def _transliterate_mixed(text: str):
-    if not text:
-        return None
-    runs, buf, cur_script = [], "", None
-    for ch in text:
-        s = detect_script_one(ch) if ch.strip() else cur_script
-        if s != cur_script and buf:
-            runs.append((cur_script, buf))
-            buf = ""
-        cur_script = s
-        buf += ch
-    if buf:
-        runs.append((cur_script, buf))
-
-    out = []
-    for script, chunk in runs:
-        if script in ("latin", "unknown"):
-            out.append(chunk)
-        else:
-            transliterated = _translit_run(script, chunk)
-            # Fallback: if a non-Latin run survives transliteration
-            # unexpectedly (library missing/unsupported script), keep
-            # the original chunk rather than dropping it silently.
-            out.append(transliterated if transliterated else chunk)
-    result = " ".join(p for p in out if p and p.strip())
-    return result.strip() if result else None
-
-
-def transliterate_one(text, script):
-    if not text or not text.strip():
-        return None
-    if script == "latin" or script == "unknown":
-        return text
-    if script == "tamil":
-        result = _tamil_transliterate(text)
-    elif script in _SANSCRIPT_SCHEME:
-        result = _itrans_transliterate(text, script)
-    elif script == "mixed":
-        result = _transliterate_mixed(text)
-    else:
-        result = None
-    # fallback: unsupported/failed transliteration -> keep original text
-    # safely rather than losing the field
-    if result is None:
-        return text
-    return result
-
-
-def transliterate_series(text_series: pd.Series, script_series: pd.Series) -> pd.Series:
-    """Vectorized-as-possible: only runs transliteration work on rows
-    that are actually non-Latin, skipping already-Latin text entirely."""
-    if not ENABLE_TRANSLITERATION:
-        return text_series
-
-    result = text_series.copy()
-    non_latin_mask = ~script_series.isin(["latin", "unknown"]) & text_series.notna() & (text_series != "")
-
-    if non_latin_mask.any():
-        translit_vals = [
-            transliterate_one(t, s)
-            for t, s in zip(text_series[non_latin_mask], script_series[non_latin_mask])
-        ]
-        result.loc[non_latin_mask] = translit_vals
-
-    # light cleanup + schwa-artifact trim, applied once to the whole
-    # transliterated/Latin column (cheap ascii-only regex work)
-    result = result.map(
-        lambda x: _strip_residual_script(
-            clean_transliteration(normalize_whitespace_str(normalize_punctuation_str(x)))
-        )
-        if isinstance(x, str) and x else x
+    text = AMP_PATTERN.sub(
+        " and ",
+        text
     )
-    return result
 
+    text = PUNCT_PATTERN.sub(
+        " ",
+        text
+    )
 
-def normalize_whitespace_str(text: str) -> str:
-    return WHITESPACE_PATTERN.sub(" ", text).strip()
-
-
-def normalize_punctuation_str(text: str) -> str:
-    text = AMP_PATTERN.sub(" and ", text)
-    text = PUNCT_PATTERN.sub(" ", text)
     return normalize_whitespace_str(text)
 
 
-# ------------------------------------------------------------
-# NAME-SPECIFIC DERIVED FIELDS
-# ------------------------------------------------------------
+def clean_transliteration(text):
 
-def strip_suffixes(series: pd.Series) -> pd.Series:
-    return series.str.replace(_SUFFIX_STRIP_PATTERN, "", regex=True).pipe(normalize_whitespace)
+    if not text:
+        return text
+
+    words = []
+
+    for word in text.split():
+
+        if word in SCHWA_PROTECT or len(word) <= 3:
+            words.append(word)
+            continue
+
+        stripped = SCHWA_STRIP_RE.sub(
+            "",
+            word
+        )
+
+        words.append(
+            stripped if stripped else word
+        )
+
+    return " ".join(words)
+
+def strip_latin_diacritics(text):
+    """
+    Convert Latin characters with diacritics to plain ASCII.
+
+    Examples:
+        ḷ -> l
+        ō -> o
+        ṉ -> n
+        ā -> a
+    """
+    if not text:
+        return text
+
+    normalized = unicodedata.normalize("NFKD", text)
+
+    return "".join(
+        ch for ch in normalized
+        if not unicodedata.combining(ch)
+    )
+
+def strip_residual_script(text):
+
+    if not text:
+        return text
+
+    text = RESIDUAL_SCRIPT_RE.sub(
+        "",
+        text
+    )
+
+    return normalize_whitespace_str(text)
 
 
-def sorted_tokens(series: pd.Series) -> pd.Series:
-    if not ENABLE_SORTED_TOKENS:
-        return pd.Series([np.nan] * len(series), index=series.index)
+# ============================================================
+# BASIC NORMALIZATION
+# ============================================================
+
+def unicode_normalize_series(series):
+
     return series.map(
-        lambda x: " ".join(sorted(x.split())) if pd.notna(x) and x else x
+        lambda x:
+            unicodedata.normalize("NFKC", x)
+            if isinstance(x, str)
+            else x
     )
 
 
-def phonetic_code(series: pd.Series) -> pd.Series:
-    """NYSIIS phonetic code, computed once on the transliterated/Latin
-    name. Missing/empty values are skipped, never encoded."""
-    if not ENABLE_PHONETIC or not HAVE_JELLYFISH:
-        return pd.Series([np.nan] * len(series), index=series.index)
-    return series.map(
-        lambda x: jellyfish.nysiis(x) if pd.notna(x) and x else np.nan
+def basic_clean(series):
+
+    series = unicode_normalize_series(series)
+
+    series = series.str.casefold()
+
+    series = series.str.replace(
+        LEADING_JUNK_PATTERN,
+        "",
+        regex=True
+    )
+
+    series = series.str.replace(
+        WHITESPACE_PATTERN,
+        " ",
+        regex=True
+    ).str.strip()
+
+    series = series.str.replace(
+        AMP_PATTERN,
+        " and ",
+        regex=True
+    )
+
+    series = series.str.replace(
+        PUNCT_PATTERN,
+        " ",
+        regex=True
+    )
+
+    series = series.str.replace(
+        WHITESPACE_PATTERN,
+        " ",
+        regex=True
+    ).str.strip()
+
+    return series
+
+
+# ============================================================
+# DICTIONARY NORMALIZATION
+# ============================================================
+
+def apply_suffix_map(series):
+
+    return series.str.replace(
+        SUFFIX_COMBINED,
+        SUFFIX_REPLACER,
+        regex=True
+    ).str.replace(
+        WHITESPACE_PATTERN,
+        " ",
+        regex=True
+    ).str.strip()
+
+
+def apply_street_map(series):
+
+    return series.str.replace(
+        STREET_COMBINED,
+        STREET_REPLACER,
+        regex=True
+    ).str.replace(
+        WHITESPACE_PATTERN,
+        " ",
+        regex=True
+    ).str.strip()
+
+
+# ============================================================
+# DOMAIN
+# ============================================================
+
+def extract_domain(text):
+
+    if not text:
+        return None
+
+    match = EMAIL_RE.search(text)
+
+    if match:
+        return match.group(1).lower().rstrip(".")
+
+    match = URL_RE.search(text)
+
+    if match:
+
+        domain = match.group(1).lower().rstrip(".")
+
+        if "." in domain:
+            return domain
+
+    return None
+
+
+# ============================================================
+# SCRIPT DETECTION
+# ============================================================
+
+def first_meaningful_char(text):
+
+    if not text:
+        return None
+
+    for char in text:
+
+        if char.isspace():
+            continue
+
+        if char.isalnum():
+            return char
+
+    return None
+
+
+def script_from_first_character(text):
+
+    first = first_meaningful_char(text)
+
+    if first is None:
+        return "unknown"
+
+    return SCRIPT_BY_CHAR.get(
+        first,
+        "latin"
     )
 
 
-def has_repeated_token(series: pd.Series) -> pd.Series:
-    def _check(text):
+@lru_cache(maxsize=CACHE_SIZE)
+def detect_indic_script_full(text):
+
+    if not text:
+        return "unknown"
+
+    counts = {}
+
+    for script, regex in SCRIPT_REGEXES.items():
+
+        count = len(
+            regex.findall(text)
+        )
+
+        if count:
+            counts[script] = count
+
+    if not counts:
+        return "latin"
+
+    dominant, dominant_count = max(
+        counts.items(),
+        key=lambda x: x[1]
+    )
+
+    total = sum(
+        counts.values()
+    )
+
+    if (
+        len(counts) > 1
+        and dominant_count / total < 0.6
+    ):
+        return "mixed"
+
+    return dominant
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def detect_script_fast(text, country):
+
+    if not text:
+        return "missing"
+
+    country = (
+        country.casefold()
+        if isinstance(country, str)
+        else ""
+    )
+
+    # --------------------------------------------------------
+    # Fastest path
+    # --------------------------------------------------------
+
+    if (
+        INDIA_ONLY_TRANSLITERATION
+        and country != "india"
+        and not CHECK_NON_INDIA_FOR_INDIC
+    ):
+        return "latin"
+
+    # --------------------------------------------------------
+    # First-character fast path
+    # --------------------------------------------------------
+
+    script = script_from_first_character(
+        text
+    )
+
+    if script != "latin":
+        return script
+
+    # --------------------------------------------------------
+    # Latin first character.
+    #
+    # Most strings end here.
+    #
+    # Only run the Unicode search if necessary.
+    # --------------------------------------------------------
+
+    if not INDIC_ANY_RE.search(text):
+        return "latin"
+
+    # --------------------------------------------------------
+    # Mixed-script fallback
+    # --------------------------------------------------------
+
+    return detect_indic_script_full(text)
+
+
+# ============================================================
+# TRANSLITERATION
+# ============================================================
+
+@lru_cache(maxsize=CACHE_SIZE)
+def transliterate_itrans(
+    text,
+    script
+):
+
+    if (
+        not HAVE_INDIC
+        or script not in SANSCRIPT_SCHEME
+    ):
+        return text
+
+    try:
+
+        source_scheme = getattr(
+            sanscript,
+            SANSCRIPT_SCHEME[script]
+        )
+
+        return sanscript.transliterate(
+            text,
+            source_scheme,
+            sanscript.ITRANS
+        ).lower()
+
+    except Exception:
+
+        return text
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def transliterate_tamil(text):
+
+    if not HAVE_AKSHARAMUKHA:
+        return text
+
+    try:
+
+        return aksharamukha_translit.process(
+            "Tamil",
+            "ISO",
+            text
+        ).lower()
+
+    except Exception:
+
+        return text
+
+def transliterate_script(
+    text,
+    script
+):
+
+    if not text:
+        return text
+
+    if script in (
+        "latin",
+        "unknown",
+        "missing"
+    ):
+        return text
+
+    if script in SANSCRIPT_SCHEME:
+
+        result = transliterate_itrans(
+            text,
+            script
+        )
+
+        # Tamil transliteration can produce
+        # Latin characters with diacritics:
+        # ḷ, ō, ṉ, ā, etc.
+        #
+        # Convert them to plain ASCII:
+        # l, o, n, a, etc.
+        if script == "tamil":
+            result = strip_latin_diacritics(result)
+
+        return result
+
+    if script == "mixed":
+
+        return transliterate_mixed(
+            text
+        )
+
+    return text
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def transliterate_mixed(text):
+
+    if not text:
+        return text
+
+    output = []
+
+    current_script = None
+    buffer = []
+
+    def flush():
+
+        nonlocal buffer
+        nonlocal current_script
+
+        if not buffer:
+            return
+
+        chunk = "".join(buffer)
+
+        if current_script in (
+            "latin",
+            "unknown",
+            None
+        ):
+
+            output.append(chunk)
+
+        else:
+
+            output.append(
+                transliterate_script(
+                    chunk,
+                    current_script
+                )
+            )
+
+        buffer = []
+
+    for char in text:
+
+        if char.isspace():
+
+            buffer.append(char)
+            continue
+
+        script = SCRIPT_BY_CHAR.get(
+            char,
+            "latin"
+        )
+
+        if script != current_script:
+
+            flush()
+
+            current_script = script
+
+        buffer.append(char)
+
+    flush()
+
+    return "".join(output)
+
+
+# ============================================================
+# ONE-PASS DETECTION + TRANSLITERATION
+# ============================================================
+
+@lru_cache(maxsize=CACHE_SIZE)
+def detect_and_transliterate(
+    text,
+    country
+):
+
+    if not text:
+        return text, "missing"
+
+    script = detect_script_fast(
+        text,
+        country
+    )
+
+    if script == "latin":
+
+        return text, "latin"
+
+    transliterated = transliterate_script(
+        text,
+        script
+    )
+
+    transliterated = normalize_whitespace_str(
+        normalize_punctuation_str(
+            clean_transliteration(
+                strip_residual_script(
+                    transliterated
+                )
+            )
+        )
+    )
+
+    return transliterated, script
+
+
+def process_transliteration_series(
+    text_series,
+    country_series
+):
+
+    results = []
+    scripts = []
+
+    for text, country in zip(
+        text_series,
+        country_series
+    ):
+
+        if not isinstance(text, str) or not text:
+
+            results.append(text)
+            scripts.append("missing")
+            continue
+
+        transliterated, script = (
+            detect_and_transliterate(
+                text,
+                country
+            )
+        )
+
+        results.append(
+            transliterated
+        )
+
+        scripts.append(
+            script
+        )
+
+    return (
+        pd.Series(
+            results,
+            index=text_series.index
+        ),
+        pd.Series(
+            scripts,
+            index=text_series.index
+        )
+    )
+
+
+# ============================================================
+# NAME PROCESSING
+# ============================================================
+
+SUFFIX_STRIP_PATTERN = re.compile(
+    r"\b(" +
+    "|".join(
+        re.escape(x)
+        for x in SUFFIX_TOKENS
+    ) +
+    r")\b"
+)
+
+
+def strip_suffixes(series):
+
+    return series.str.replace(
+        SUFFIX_STRIP_PATTERN,
+        "",
+        regex=True
+    ).str.replace(
+        WHITESPACE_PATTERN,
+        " ",
+        regex=True
+    ).str.strip()
+
+
+def sorted_tokens(series):
+
+    return series.map(
+        lambda x:
+            " ".join(
+                sorted(x.split())
+            )
+            if isinstance(x, str) and x
+            else x
+    )
+
+
+def phonetic_code(series):
+
+    if not HAVE_JELLYFISH:
+
+        return pd.Series(
+            np.nan,
+            index=series.index
+        )
+
+    return series.map(
+        lambda x:
+            jellyfish.nysiis(x)
+            if isinstance(x, str) and x
+            else np.nan
+    )
+
+
+def repeated_token(series):
+
+    def check(text):
+
         if not text:
             return False
+
         tokens = text.lower().split()
+
         if len(tokens) < 2:
             return False
+
         counts = Counter(tokens)
-        return any(c > 1 for tok, c in counts.items() if len(tok) > 2)
-    return series.map(_check)
+
+        return any(
+            count > 1
+            for token, count
+            in counts.items()
+            if len(token) > 2
+        )
+
+    return series.map(check)
 
 
-# ------------------------------------------------------------
-# ADDRESS-SPECIFIC DERIVED FIELDS
-# ------------------------------------------------------------
+# ============================================================
+# ADDRESS PROCESSING
+# ============================================================
 
-def extract_unit(series: pd.Series) -> pd.Series:
+def extract_unit(series):
+
     return series.map(
-        lambda x: (m.group(1) if (m := UNIT_PATTERN.search(x)) else np.nan)
-        if pd.notna(x) else np.nan
+        lambda x:
+            (
+                match.group(1)
+                if (
+                    match := UNIT_PATTERN.search(x)
+                )
+                else np.nan
+            )
+            if isinstance(x, str)
+            else np.nan
     )
 
 
-def remove_unit_fragment(series: pd.Series) -> pd.Series:
-    return series.str.replace(UNIT_PATTERN, " ", regex=True).pipe(normalize_whitespace)
+def remove_unit(series):
+
+    return series.str.replace(
+        UNIT_PATTERN,
+        " ",
+        regex=True
+    ).str.replace(
+        WHITESPACE_PATTERN,
+        " ",
+        regex=True
+    ).str.strip()
 
 
-def extract_numeric_tokens(series: pd.Series) -> pd.Series:
-    return series.map(lambda x: _NUMERIC_TOKEN_RE.findall(x) if pd.notna(x) and x else [])
+def extract_numeric_tokens(series):
+
+    return series.map(
+        lambda x:
+            NUMERIC_TOKEN_RE.findall(x)
+            if isinstance(x, str) and x
+            else []
+    )
 
 
-# ------------------------------------------------------------
-# MAIN PER-SOURCE PREPROCESSING FUNCTION
-# ------------------------------------------------------------
+# ============================================================
+# MAIN PREPROCESSOR
+# ============================================================
 
-def preprocess_source(df: pd.DataFrame, id_col: str = "entity_id") -> pd.DataFrame:
+def preprocess_source(
+    df,
+    id_col="entity_id"
+):
+
+    timings = {}
+
+    total_start = time.perf_counter()
+
     out = df.copy()
 
-    # --- missing flags first, on raw columns ---
-    raw_name = out["business_name"]
-    raw_addr = out["business_address"]
-    out["name_is_missing"] = raw_name.isna() | (raw_name.astype(str).str.strip() == "")
-    out["address_is_missing"] = raw_addr.isna() | (raw_addr.astype(str).str.strip() == "")
+    # --------------------------------------------------------
+    # COUNTRY
+    # --------------------------------------------------------
 
-    name_raw_filled = raw_name.fillna("")
-    addr_raw_filled = raw_addr.fillna("")
+    start = time.perf_counter()
 
-    # --- structured extraction on RAW fields (before normalization) ---
-    out["domain"] = extract_domain_series(name_raw_filled)
-    out["has_repeated_token"] = has_repeated_token(name_raw_filled)
-    out["address_numeric_tokens"] = extract_numeric_tokens(addr_raw_filled)
-
-    # --- script detection on RAW fields, before any normalization ---
-    out["script_name"] = detect_script_series(raw_name)
-    out["script_address"] = detect_script_series(raw_addr)
-
-    # --- domain fragment removal so it never pollutes name_normalized ---
-    name_no_domain = remove_domain_fragment(name_raw_filled)
-
-    # --- NAME pipeline ---
-    name_clean = basic_clean(name_no_domain)
-    name_clean = name_clean.str.replace(r"#\w*", " ", regex=True).pipe(normalize_whitespace)
-    out["name_normalized"] = apply_dictionary(name_clean, SUFFIX_MAP)
-    out["name_suffix_stripped"] = strip_suffixes(out["name_normalized"])
-    out["name_sorted_tokens"] = sorted_tokens(out["name_suffix_stripped"])
-    out["name_transliterated"] = transliterate_series(out["name_normalized"], out["script_name"])
-    out["name_transliterated_suffix_stripped"] = strip_suffixes(out["name_transliterated"])
-    out["name_phonetic"] = phonetic_code(out["name_transliterated"])
-
-    out.loc[out["name_is_missing"], [
-        "name_normalized", "name_suffix_stripped", "name_sorted_tokens",
-        "name_transliterated", "name_transliterated_suffix_stripped", "name_phonetic",
-    ]] = np.nan
-
-    # --- ADDRESS pipeline ---
-    addr_clean = basic_clean(addr_raw_filled)
-    addr_clean = apply_dictionary(addr_clean, STREET_MAP)
-    out["unit_value"] = extract_unit(addr_clean)
-    addr_no_unit = remove_unit_fragment(addr_clean)
-    out["address_normalized"] = addr_no_unit.str.replace(r"#\w*", " ", regex=True).pipe(normalize_whitespace)
-    out["address_transliterated"] = transliterate_series(out["address_normalized"], out["script_address"])
-
-    out.loc[out["address_is_missing"], [
-        "unit_value", "address_normalized", "address_transliterated",
-    ]] = np.nan
-    out.loc[out["address_is_missing"], "address_numeric_tokens"] = pd.Series(
-        [[] for _ in range(out["address_is_missing"].sum())],
-        index=out.index[out["address_is_missing"]],
+    country_normalized = (
+        out["country"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.casefold()
     )
 
-    # --- COUNTRY: light touch only ---
-    out["country_normalized"] = out["country"].astype(str).str.strip().str.casefold()
+    out["country_normalized"] = (
+        country_normalized
+    )
+
+    timings["country"] = (
+        time.perf_counter() - start
+    )
+
+    # --------------------------------------------------------
+    # MISSING FLAGS
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    name_raw = out["business_name"]
+
+    address_raw = out["business_address"]
+
+    out["name_is_missing"] = (
+        name_raw.isna()
+        |
+        name_raw.astype(str)
+        .str.strip()
+        .eq("")
+    )
+
+    out["address_is_missing"] = (
+        address_raw.isna()
+        |
+        address_raw.astype(str)
+        .str.strip()
+        .eq("")
+    )
+
+    name_filled = name_raw.fillna("")
+
+    address_filled = address_raw.fillna("")
+
+    timings["missing flags"] = (
+        time.perf_counter() - start
+    )
+
+    # --------------------------------------------------------
+    # RAW EXTRACTION
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    out["domain"] = (
+        name_filled.map(
+            extract_domain
+        )
+    )
+
+    out["has_repeated_token"] = (
+        repeated_token(
+            name_filled
+        )
+    )
+
+    out["address_numeric_tokens"] = (
+        extract_numeric_tokens(
+            address_filled
+        )
+    )
+
+    timings["raw extraction"] = (
+        time.perf_counter() - start
+    )
+
+    # ========================================================
+    # NAME
+    # ========================================================
+
+    # --------------------------------------------------------
+    # Name normalization
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    name_no_domain = (
+        name_filled
+        .str.replace(
+            EMAIL_RE,
+            " ",
+            regex=True
+        )
+        .str.replace(
+            URL_RE,
+            " ",
+            regex=True
+        )
+    )
+
+    name_clean = basic_clean(
+        name_no_domain
+    )
+
+    name_clean = (
+        name_clean
+        .str.replace(
+            r"#\w*",
+            " ",
+            regex=True
+        )
+        .str.replace(
+            WHITESPACE_PATTERN,
+            " ",
+            regex=True
+        )
+        .str.strip()
+    )
+
+    out["name_normalized"] = (
+        apply_suffix_map(
+            name_clean
+        )
+    )
+
+    out["name_suffix_stripped"] = (
+        strip_suffixes(
+            out["name_normalized"]
+        )
+    )
+
+    out["name_sorted_tokens"] = (
+        sorted_tokens(
+            out["name_suffix_stripped"]
+        )
+    )
+
+    timings["name normalization"] = (
+        time.perf_counter() - start
+    )
+
+    # --------------------------------------------------------
+    # Name transliteration
+    #
+    # IMPORTANT:
+    # Detection + transliteration are now one logical pass.
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    (
+        out["name_transliterated"],
+        out["script_name"]
+    ) = process_transliteration_series(
+        out["name_normalized"],
+        country_normalized
+    )
+
+    out["name_transliterated_suffix_stripped"] = (
+        strip_suffixes(
+            out["name_transliterated"]
+        )
+    )
+
+    timings["name transliteration"] = (
+        time.perf_counter() - start
+    )
+
+    # --------------------------------------------------------
+    # Name phonetic
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    out["name_phonetic"] = (
+        phonetic_code(
+            out["name_transliterated"]
+        )
+    )
+
+    timings["name phonetic"] = (
+        time.perf_counter() - start
+    )
+
+    # ========================================================
+    # ADDRESS
+    # ========================================================
+
+    # --------------------------------------------------------
+    # Address normalization
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    address_clean = basic_clean(
+        address_filled
+    )
+
+    address_clean = apply_street_map(
+        address_clean
+    )
+
+    out["unit_value"] = (
+        extract_unit(
+            address_clean
+        )
+    )
+
+    address_no_unit = remove_unit(
+        address_clean
+    )
+
+    out["address_normalized"] = (
+        address_no_unit
+        .str.replace(
+            r"#\w*",
+            " ",
+            regex=True
+        )
+        .str.replace(
+            WHITESPACE_PATTERN,
+            " ",
+            regex=True
+        )
+        .str.strip()
+    )
+
+    timings["address normalization"] = (
+        time.perf_counter() - start
+    )
+
+    # --------------------------------------------------------
+    # Address transliteration
+    # --------------------------------------------------------
+
+    start = time.perf_counter()
+
+    (
+        out["address_transliterated"],
+        out["script_address"]
+    ) = process_transliteration_series(
+        out["address_normalized"],
+        country_normalized
+    )
+
+    timings["address transliteration"] = (
+        time.perf_counter() - start
+    )
+
+    # --------------------------------------------------------
+    # Missing-value cleanup
+    # --------------------------------------------------------
+
+    out.loc[
+        out["name_is_missing"],
+        [
+            "name_normalized",
+            "name_suffix_stripped",
+            "name_sorted_tokens",
+            "name_transliterated",
+            "name_transliterated_suffix_stripped",
+            "name_phonetic",
+        ]
+    ] = np.nan
+
+    out.loc[
+        out["address_is_missing"],
+        [
+            "unit_value",
+            "address_normalized",
+            "address_transliterated",
+        ]
+    ] = np.nan
+
+    missing_addresses = int(
+        out["address_is_missing"].sum()
+    )
+
+    if missing_addresses:
+
+        out.loc[
+            out["address_is_missing"],
+            "address_numeric_tokens"
+        ] = pd.Series(
+            [
+                []
+                for _ in range(missing_addresses)
+            ],
+            index=out.index[out["address_is_missing"]]
+        )
+
+    # --------------------------------------------------------
+    # Final columns
+    # --------------------------------------------------------
 
     final_cols = [
-        id_col, "business_name", "business_address", "country",
-        "name_is_missing", "address_is_missing",
-        "script_name", "script_address",
-        "name_normalized", "name_suffix_stripped", "name_sorted_tokens",
-        "name_transliterated", "name_transliterated_suffix_stripped", "name_phonetic",
-        "address_normalized", "address_transliterated",
-        "address_numeric_tokens", "unit_value",
-        "domain", "has_repeated_token", "country_normalized",
+        id_col,
+
+        "business_name",
+        "business_address",
+        "country",
+
+        "name_is_missing",
+        "address_is_missing",
+
+        "script_name",
+        "script_address",
+
+        "name_normalized",
+        "name_suffix_stripped",
+        "name_sorted_tokens",
+
+        "name_transliterated",
+        "name_transliterated_suffix_stripped",
+        "name_phonetic",
+
+        "address_normalized",
+        "address_transliterated",
+
+        "address_numeric_tokens",
+        "unit_value",
+
+        "domain",
+        "has_repeated_token",
+
+        "country_normalized",
     ]
-    final_cols = [c for c in final_cols if c in out.columns]
-    return out[final_cols]
+
+    final_cols = [
+        col
+        for col in final_cols
+        if col in out.columns
+    ]
+
+    result = out[
+        final_cols
+    ]
+
+    timings["total"] = (
+        time.perf_counter() - total_start
+    )
+
+    # ========================================================
+    # PROFILING
+    # ========================================================
+
+    if PROFILE:
+
+        print()
+        print(
+            "======================================"
+        )
+        print(
+            "       PREPROCESSING TIMING"
+        )
+        print(
+            "======================================"
+        )
+
+        for key, value in timings.items():
+
+            print(
+                f"{key:30s}: "
+                f"{value:9.2f} sec"
+            )
+
+        print(
+            "======================================"
+        )
+
+        print(
+            "\nCACHE STATISTICS"
+        )
+
+        print(
+            "detect_script_fast:",
+            detect_script_fast.cache_info()
+        )
+
+        print(
+            "detect_indic_script_full:",
+            detect_indic_script_full.cache_info()
+        )
+
+        print(
+            "detect_and_transliterate:",
+            detect_and_transliterate.cache_info()
+        )
+
+        print(
+            "transliterate_itrans:",
+            transliterate_itrans.cache_info()
+        )
+
+        print(
+            "transliterate_tamil:",
+            transliterate_tamil.cache_info()
+        )
+
+        print(
+            "transliterate_mixed:",
+            transliterate_mixed.cache_info()
+        )
+
+    return result
+
+processed = preprocess_source(
+    df2_5k
+)
+
+processed.to_csv(
+    "/content/drive/MyDrive/Amazon ML Challenge/optimised df2.tsv",
+    sep="\t",
+    index=False
+)
+
 
 df2_5k = df2.head(5000).copy()
 
